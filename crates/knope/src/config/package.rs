@@ -34,6 +34,7 @@ impl Package {
     pub(crate) fn find_in_working_dir() -> Result<Vec<Self>, Error> {
         let mut packages = Self::cargo_workspace_members()?;
         packages.extend(Self::npm_workspaces()?);
+        packages.extend(Self::deno_workspaces()?);
 
         if !packages.is_empty() {
             return Ok(packages);
@@ -247,6 +248,227 @@ impl Package {
         Ok(packages)
     }
 
+    /// Attempts to read and parse a single deno config file
+    fn try_read_deno_config_file(
+        file_path: std::path::PathBuf,
+    ) -> Result<Option<(RelativePathBuf, Value)>, DenoWorkspaceError> {
+        let Ok(contents) = read_to_string(&file_path) else {
+            return Ok(None);
+        };
+
+        let relative_path = file_path.relative_to(".").map_err(|_| {
+            DenoWorkspaceError::UnknownFile(UnknownFile {
+                path: RelativePathBuf::from(file_path.to_string_lossy().to_string()),
+            })
+        })?;
+
+        let json =
+            serde_json::Value::from_str(&contents).map_err(|err| DenoWorkspaceError::Json {
+                path: relative_path.clone(),
+                source: err,
+            })?;
+
+        Ok(Some((relative_path, json)))
+    }
+
+    /// Reads deno configuration files in priority order: deno.json, deno.jsonc, package.json
+    fn read_deno_config_files(
+        base_path: &std::path::Path,
+    ) -> Result<Option<(RelativePathBuf, Value)>, DenoWorkspaceError> {
+        let file_configs = ["deno.json", "deno.jsonc", "package.json"];
+
+        for filename in file_configs {
+            let file_path = base_path.join(filename);
+            if let Some(result) = Self::try_read_deno_config_file(file_path)? {
+                return Ok(Some(result));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Strip JSON comments (// and /* */) to make JSONC parseable as JSON
+    fn strip_json_comments(content: &str) -> String {
+        let mut result = String::new();
+        let mut chars = content.chars().peekable();
+        let mut in_string = false;
+        let mut escaped = false;
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' if !escaped => {
+                    in_string = !in_string;
+                    result.push(ch);
+                }
+                '\\' if in_string => {
+                    escaped = !escaped;
+                    result.push(ch);
+                }
+                '/' if !in_string && !escaped => {
+                    if let Some(&next_ch) = chars.peek() {
+                        if next_ch == '/' {
+                            // Skip line comment
+                            chars.next(); // consume the second '/'
+                            while let Some(ch) = chars.next() {
+                                if ch == '\n' {
+                                    result.push(ch);
+                                    break;
+                                }
+                            }
+                        } else if next_ch == '*' {
+                            // Skip block comment
+                            chars.next(); // consume the '*'
+                            let mut found_end = false;
+                            while let Some(ch) = chars.next() {
+                                if ch == '*' {
+                                    if let Some(&'/') = chars.peek() {
+                                        chars.next(); // consume the '/'
+                                        found_end = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !found_end {
+                                // Unclosed comment, but we'll let JSON parser handle the error
+                            }
+                        } else {
+                            result.push(ch);
+                        }
+                    } else {
+                        result.push(ch);
+                    }
+                }
+                _ => {
+                    result.push(ch);
+                    if ch != '\\' {
+                        escaped = false;
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    fn deno_workspaces() -> Result<Vec<Self>, DenoWorkspaceError> {
+        #[derive(Debug)]
+        struct Workspace {
+            path: RelativePathBuf,
+            value: Value,
+        }
+
+        // Check if there's a root deno.json file
+        let root_deno_content = read_to_string("deno.json")
+            .ok()
+            .or_else(|| read_to_string("deno.jsonc").ok());
+        let Some(root_deno_content) = root_deno_content else {
+            return Ok(Vec::new());
+        };
+
+        // Parse the root deno.json, handling JSONC (JSON with comments)
+        let root_json = match serde_json::Value::from_str(&root_deno_content) {
+            Ok(json) => json,
+            Err(_) => {
+                // Try to strip comments and parse again (for JSONC)
+                let stripped = Self::strip_json_comments(&root_deno_content);
+                serde_json::Value::from_str(&stripped)
+                    .ok()
+                    .unwrap_or_default()
+            }
+        };
+
+        let lock_file = PathBuf::from("deno.lock").exists();
+        let mut workspaces = Vec::new();
+
+        // Check if it has workspace patterns
+        if let Some(workspace_patterns) = root_json.get("workspace").and_then(|w| w.as_array()) {
+            // This is a workspace-based project - process the patterns
+            for workspace_pattern in workspace_patterns
+                .iter()
+                .filter_map(|pattern| pattern.as_str())
+            {
+                let paths = glob(workspace_pattern).map_err(|source| DenoWorkspaceError::Glob {
+                    pattern: workspace_pattern.to_string(),
+                    source,
+                })?;
+                for path in paths {
+                    let Ok(path) = path else { continue };
+                    // Only process directories, not files
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    if let Some((relative_path, json)) = Self::read_deno_config_files(&path)? {
+                        workspaces.push(Workspace {
+                            path: relative_path,
+                            value: json,
+                        });
+                    }
+                }
+            }
+        } else {
+            // No workspace field - return empty (no deno packages to version)
+            return Ok(Vec::new());
+        }
+
+        let mut packages = Vec::with_capacity(workspaces.len());
+
+        for workspace in &workspaces {
+            // Only process workspaces that have both name and version
+            let Some(name) = workspace.value.get("name").and_then(|name| name.as_str()) else {
+                continue;
+            };
+
+            let has_version = workspace
+                .value
+                .get("version")
+                .and_then(|v| v.as_str())
+                .is_some();
+
+            if !has_version {
+                continue;
+            }
+
+            let name = name.to_string();
+
+            let mut versioned_files = vec![VersionedFileConfig::new(workspace.path.clone(), None)?];
+
+            if lock_file {
+                versioned_files.push(VersionedFileConfig::new(
+                    "deno.lock".into(),
+                    Some(name.clone()),
+                )?);
+            }
+
+            // Check for dependencies between deno packages
+            for other_workspace in &workspaces {
+                if other_workspace.path == workspace.path {
+                    continue;
+                }
+                if other_workspace
+                    .value
+                    .get("imports")
+                    .and_then(|deps| deps.get(&name))
+                    .is_some()
+                {
+                    versioned_files.push(VersionedFileConfig::new(
+                        other_workspace.path.clone(),
+                        Some(name.clone()),
+                    )?);
+                }
+            }
+
+            packages.push(Package {
+                name: package::Name::Custom(name.clone()),
+                versioned_files,
+                changelog: workspace.path.parent().map(|dir| dir.join("CHANGELOG.md")),
+                scopes: Some(vec![name]),
+                ..Default::default()
+            });
+        }
+
+        Ok(packages)
+    }
+
     pub(crate) fn from_toml(
         name: package::Name,
         package: knope_config::Package,
@@ -385,6 +607,25 @@ pub(crate) enum NPMWorkspaceError {
 }
 
 #[derive(Debug, Diagnostic, Error)]
+pub(crate) enum DenoWorkspaceError {
+    #[error("Could not process workspaces glob pattern {pattern} in deno.json: {source}")]
+    #[diagnostic(code(workspaces::deno_glob))]
+    Glob {
+        pattern: String,
+        source: glob::PatternError,
+    },
+    #[error("Could not parse JSON in {path}: {source}")]
+    #[diagnostic(code(workspaces::deno_json))]
+    Json {
+        path: RelativePathBuf,
+        source: serde_json::Error,
+    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    UnknownFile(#[from] UnknownFile),
+}
+
+#[derive(Debug, Diagnostic, Error)]
 pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -392,4 +633,7 @@ pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     NPMWorkspace(#[from] NPMWorkspaceError),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DenoWorkspace(#[from] DenoWorkspaceError),
 }

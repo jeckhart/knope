@@ -4,7 +4,7 @@ use ::toml::Spanned;
 use glob::glob;
 use itertools::Itertools;
 use knope_config::{Assets, ChangelogSection};
-use knope_versioning::{UnknownFile, VersionedFileConfig, package, versioned_file::cargo};
+use knope_versioning::{UnknownFile, VersionedFileConfig, jsonc, package, versioned_file::cargo};
 use miette::Diagnostic;
 use relative_path::{PathExt, RelativePath, RelativePathBuf};
 use serde_json::Value;
@@ -262,11 +262,16 @@ impl Package {
             })
         })?;
 
-        let json =
-            serde_json::Value::from_str(&contents).map_err(|err| DenoWorkspaceError::Json {
-                path: relative_path.clone(),
-                source: err,
-            })?;
+        let json = match serde_json::Value::from_str(&contents) {
+            Ok(json) => json,
+            Err(_) => {
+                let stripped = jsonc::strip_json_comments(&contents);
+                serde_json::Value::from_str(&stripped).map_err(|err| DenoWorkspaceError::Json {
+                    path: relative_path.clone(),
+                    source: err,
+                })?
+            }
+        };
 
         Ok(Some((relative_path, json)))
     }
@@ -285,69 +290,6 @@ impl Package {
         }
 
         Ok(None)
-    }
-
-    /// Strip JSON comments (// and /* */) to make JSONC parseable as JSON
-    fn strip_json_comments(content: &str) -> String {
-        let mut result = String::new();
-        let mut chars = content.chars().peekable();
-        let mut in_string = false;
-        let mut escaped = false;
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '"' if !escaped => {
-                    in_string = !in_string;
-                    result.push(ch);
-                }
-                '\\' if in_string => {
-                    escaped = !escaped;
-                    result.push(ch);
-                }
-                '/' if !in_string && !escaped => {
-                    if let Some(&next_ch) = chars.peek() {
-                        if next_ch == '/' {
-                            // Skip line comment
-                            chars.next(); // consume the second '/'
-                            while let Some(ch) = chars.next() {
-                                if ch == '\n' {
-                                    result.push(ch);
-                                    break;
-                                }
-                            }
-                        } else if next_ch == '*' {
-                            // Skip block comment
-                            chars.next(); // consume the '*'
-                            let mut found_end = false;
-                            while let Some(ch) = chars.next() {
-                                if ch == '*' {
-                                    if let Some(&'/') = chars.peek() {
-                                        chars.next(); // consume the '/'
-                                        found_end = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !found_end {
-                                // Unclosed comment, but we'll let JSON parser handle the error
-                            }
-                        } else {
-                            result.push(ch);
-                        }
-                    } else {
-                        result.push(ch);
-                    }
-                }
-                _ => {
-                    result.push(ch);
-                    if ch != '\\' {
-                        escaped = false;
-                    }
-                }
-            }
-        }
-
-        result
     }
 
     fn deno_workspaces() -> Result<Vec<Self>, DenoWorkspaceError> {
@@ -370,7 +312,7 @@ impl Package {
             Ok(json) => json,
             Err(_) => {
                 // Try to strip comments and parse again (for JSONC)
-                let stripped = Self::strip_json_comments(&root_deno_content);
+                let stripped = jsonc::strip_json_comments(&root_deno_content);
                 serde_json::Value::from_str(&stripped)
                     .ok()
                     .unwrap_or_default()
@@ -636,4 +578,39 @@ pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     DenoWorkspace(#[from] DenoWorkspaceError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use serde_json::Value;
+    use tempfile::tempdir_in;
+
+    use super::Package;
+
+    #[test]
+    fn try_read_deno_config_file_supports_jsonc() {
+        let temp_dir = tempdir_in(".").unwrap();
+        let file_path = temp_dir.path().join("deno.jsonc");
+        fs::write(
+            &file_path,
+            "{\n  // comment\n  \"name\": \"@scope/package\",\n  \"version\": \"1.0.0\"\n}\n",
+        )
+        .unwrap();
+
+        let relative_path = file_path
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap()
+            .to_path_buf();
+
+        let result = Package::try_read_deno_config_file(relative_path).unwrap();
+        let (path, json) = result.expect("file should parse");
+
+        assert!(path.as_str().ends_with("deno.jsonc"));
+        assert_eq!(
+            json.get("name"),
+            Some(&Value::String("@scope/package".into()))
+        );
+    }
 }

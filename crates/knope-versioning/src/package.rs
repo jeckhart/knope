@@ -245,7 +245,7 @@ fn validate_dependency(
     versioned_files: &[(Config, &VersionedFile)],
 ) -> Result<Config, Box<NewError>> {
     match (&config.format, config.dependency.is_some()) {
-        (Format::Cargo | Format::PackageJson | Format::PackageLockJson, _)
+        (Format::Cargo | Format::PackageJson | Format::PackageLockJson | Format::DenoJson, _)
         | (Format::CargoLock, true) => Ok(config),
         (Format::CargoLock, false) => {
             // `Cargo.lock` needs to target a dependency. If there is a `Cargo.toml` file which is

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::{action::Action, semver::Version};
+use crate::{action::Action, jsonc, semver::Version};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DenoJson {
@@ -24,7 +24,7 @@ impl DenoJson {
             Ok(parsed) => parsed,
             Err(_) => {
                 // If that fails, try to strip comments and parse again (for JSONC)
-                let stripped = Self::strip_json_comments(&content);
+                let stripped = jsonc::strip_json_comments(&content);
                 serde_json::from_str(&stripped).map_err(|err| Error::Deserialize {
                     path: path.clone(),
                     source: err,
@@ -40,69 +40,6 @@ impl DenoJson {
         })
     }
 
-    /// Strip JSON comments (// and /* */) to make JSONC parseable as JSON
-    fn strip_json_comments(content: &str) -> String {
-        let mut result = String::new();
-        let mut chars = content.chars().peekable();
-        let mut in_string = false;
-        let mut escaped = false;
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '"' if !escaped => {
-                    in_string = !in_string;
-                    result.push(ch);
-                }
-                '\\' if in_string => {
-                    escaped = !escaped;
-                    result.push(ch);
-                }
-                '/' if !in_string && !escaped => {
-                    if let Some(&next_ch) = chars.peek() {
-                        if next_ch == '/' {
-                            // Skip line comment
-                            chars.next(); // consume the second '/'
-                            while let Some(ch) = chars.next() {
-                                if ch == '\n' {
-                                    result.push(ch);
-                                    break;
-                                }
-                            }
-                        } else if next_ch == '*' {
-                            // Skip block comment
-                            chars.next(); // consume the '*'
-                            let mut found_end = false;
-                            while let Some(ch) = chars.next() {
-                                if ch == '*' {
-                                    if let Some(&'/') = chars.peek() {
-                                        chars.next(); // consume the '/'
-                                        found_end = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !found_end {
-                                // Unclosed comment, but we'll let JSON parser handle the error
-                            }
-                        } else {
-                            result.push(ch);
-                        }
-                    } else {
-                        result.push(ch);
-                    }
-                }
-                _ => {
-                    result.push(ch);
-                    if ch != '\\' {
-                        escaped = false;
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
     pub(crate) fn get_version(&self) -> Option<&Version> {
         self.parsed.version.as_ref()
     }
@@ -116,7 +53,13 @@ impl DenoJson {
         new_version: &Version,
         dependency: Option<&str>,
     ) -> serde_json::Result<Self> {
-        let mut json = serde_json::from_str::<Map<String, Value>>(&self.raw)?;
+        let mut json = match serde_json::from_str::<Map<String, Value>>(&self.raw) {
+            Ok(json) => json,
+            Err(_) => {
+                let stripped = jsonc::strip_json_comments(&self.raw);
+                serde_json::from_str(&stripped)?
+            }
+        };
         let diff = self.diff.get_or_insert_default();
         if !diff.is_empty() {
             diff.push_str(", ");
@@ -220,6 +163,25 @@ mod tests {
         let content = r#"{"name": "@scope/package", "tasks": {"dev": "deno run main.ts"}}"#;
         let deno_json = DenoJson::new("deno.json".into(), content.to_string()).unwrap();
         let new_version = Version::from_str("1.0.0").unwrap();
+        let updated = deno_json.set_version(&new_version, None).unwrap();
+        assert_eq!(updated.get_version(), Some(&new_version));
+    }
+
+    #[test]
+    fn test_deno_json_with_comments() {
+        let content = "// leading comment\n{\"name\": \"@scope/package\", \"version\": \"1.0.0\"}";
+        let deno_json = DenoJson::new("deno.jsonc".into(), content.to_string()).unwrap();
+        assert_eq!(
+            deno_json.get_version(),
+            Some(&Version::from_str("1.0.0").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_set_version_with_comment_source() {
+        let content = "// leading comment\n{\"name\": \"@scope/package\", \"version\": \"1.0.0\"}";
+        let deno_json = DenoJson::new("deno.jsonc".into(), content.to_string()).unwrap();
+        let new_version = Version::from_str("1.2.0").unwrap();
         let updated = deno_json.set_version(&new_version, None).unwrap();
         assert_eq!(updated.get_version(), Some(&new_version));
     }

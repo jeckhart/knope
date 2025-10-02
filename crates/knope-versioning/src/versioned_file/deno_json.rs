@@ -1,5 +1,3 @@
-use std::fmt::Write;
-
 #[cfg(feature = "miette")]
 use miette::Diagnostic;
 use relative_path::RelativePathBuf;
@@ -53,6 +51,10 @@ impl DenoJson {
         new_version: &Version,
         dependency: Option<&str>,
     ) -> serde_json::Result<Self> {
+        if dependency.is_some() {
+            return Ok(self);
+        }
+
         let mut json = match serde_json::from_str::<Map<String, Value>>(&self.raw) {
             Ok(json) => json,
             Err(_) => {
@@ -60,29 +62,17 @@ impl DenoJson {
                 serde_json::from_str(&stripped)?
             }
         };
+
+        json.insert(
+            "version".to_string(),
+            Value::String(new_version.to_string()),
+        );
+
         let diff = self.diff.get_or_insert_default();
         if !diff.is_empty() {
             diff.push_str(", ");
         }
-
-        if let Some(dependency) = dependency {
-            if let Some(imports) = json
-                .get_mut("imports")
-                .and_then(|deps| deps.as_object_mut())
-            {
-                if let Some(version) = imports.get_mut(dependency) {
-                    let new_version_string = format!("jsr:{dependency}@^{new_version}");
-                    *version = Value::String(new_version_string);
-                    write!(diff, "imports.{dependency} = ^{new_version}").unwrap();
-                }
-            }
-        } else {
-            json.insert(
-                "version".to_string(),
-                Value::String(new_version.to_string()),
-            );
-            write!(diff, "version = {new_version}").unwrap();
-        }
+        diff.push_str(&format!("version = {new_version}"));
 
         self.raw = serde_json::to_string_pretty(&json)?;
         self.parsed.version = Some(new_version.clone());
@@ -184,5 +174,28 @@ mod tests {
         let new_version = Version::from_str("1.2.0").unwrap();
         let updated = deno_json.set_version(&new_version, None).unwrap();
         assert_eq!(updated.get_version(), Some(&new_version));
+    }
+
+    #[test]
+    fn test_set_version_does_not_modify_imports_for_dependencies() {
+        use serde_json::json;
+
+        let content = json!({
+            "imports": {"example": "jsr:@scope/package@^1.0.0"}
+        })
+        .to_string();
+        let deno_json = DenoJson::new("deno.json".into(), content).unwrap();
+        let original_raw = deno_json.raw.clone();
+        let new_version = Version::from_str("2.0.0").unwrap();
+
+        let updated = deno_json
+            .set_version(&new_version, Some("example"))
+            .unwrap();
+
+        assert_eq!(updated.raw, original_raw);
+        assert!(updated.diff.is_none());
+        let action = updated.write();
+
+        assert!(action.is_none());
     }
 }
